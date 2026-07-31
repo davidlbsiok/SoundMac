@@ -41,22 +41,20 @@ final class AudioEngine {
     private var selfProcessObjectID: AudioObjectID = 0
     private var aggregateDeviceID: AudioObjectID = 0
     private var ioProcID: AudioDeviceIOProcID?
+    private var currentOutputUID: String?
+    private var defaultOutputListenerBlock: AudioObjectPropertyListenerBlock?
 
     init() {
         queue.async { [weak self] in
             self?.setupPoolAndAggregate()
+            self?.watchDefaultOutputDevice()
         }
     }
 
     deinit {
+        removeDefaultOutputDeviceListener()
         queue.sync {
-            if let ioProcID {
-                AudioDeviceStop(aggregateDeviceID, ioProcID)
-                AudioDeviceDestroyIOProcID(aggregateDeviceID, ioProcID)
-            }
-            if aggregateDeviceID != 0 {
-                AudioHardwareDestroyAggregateDevice(aggregateDeviceID)
-            }
+            tearDownAggregateDevice()
             for slot in slots {
                 AudioHardwareDestroyProcessTap(slot.tapObjectID)
             }
@@ -196,10 +194,18 @@ final class AudioEngine {
         slots = createdSlots
         log.info("created \(createdSlots.count, privacy: .public) tap slot(s)")
 
+        createAggregateDevice()
+    }
+
+    /// (Re)creates the aggregate device + IOProc against whatever the current
+    /// default output device is, reusing the existing slot taps as-is. Safe to
+    /// call again later (e.g. when the user switches audio output devices).
+    private func createAggregateDevice() {
         guard let outputUID = defaultOutputDeviceUID() else {
             log.error("could not resolve default output device UID")
             return
         }
+        currentOutputUID = outputUID
 
         let description: [String: Any] = [
             kAudioAggregateDeviceUIDKey: UUID().uuidString,
@@ -241,6 +247,60 @@ final class AudioEngine {
         ioProcID = newIOProcID
         let startStatus = AudioDeviceStart(aggregateDeviceID, newIOProcID)
         log.info("AudioDeviceStart status=\(startStatus, privacy: .public)")
+    }
+
+    private func tearDownAggregateDevice() {
+        if let ioProcID {
+            AudioDeviceStop(aggregateDeviceID, ioProcID)
+            AudioDeviceDestroyIOProcID(aggregateDeviceID, ioProcID)
+            self.ioProcID = nil
+        }
+        if aggregateDeviceID != 0 {
+            AudioHardwareDestroyAggregateDevice(aggregateDeviceID)
+            aggregateDeviceID = 0
+        }
+    }
+
+    // MARK: - Output device switching
+
+    /// The aggregate device renders to a *fixed* physical sub-device chosen at
+    /// creation time — it doesn't automatically follow the system default output
+    /// (e.g. switching from headphones to speakers and back). Without this,
+    /// audio keeps going out the old device until SoundMac quits. Rebuilds the
+    /// aggregate device (only that — slot taps are untouched) whenever the
+    /// system default output actually changes.
+    private func watchDefaultOutputDevice() {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.handleDefaultOutputDeviceChanged()
+        }
+        defaultOutputListenerBlock = block
+        let status = AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, queue, block)
+        if status != noErr {
+            log.error("failed to register default output device listener (status \(status, privacy: .public))")
+        }
+    }
+
+    private func removeDefaultOutputDeviceListener() {
+        guard let block = defaultOutputListenerBlock else { return }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, queue, block)
+        defaultOutputListenerBlock = nil
+    }
+
+    private func handleDefaultOutputDeviceChanged() {
+        guard let newOutputUID = defaultOutputDeviceUID(), newOutputUID != currentOutputUID else { return }
+        log.info("default output device changed to \(newOutputUID, privacy: .public); rebuilding aggregate device")
+        tearDownAggregateDevice()
+        createAggregateDevice()
     }
 
     private func createSlotTap() -> Slot? {
